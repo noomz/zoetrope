@@ -13,6 +13,14 @@
 # `agent_session: {source, agent, kind: "id", value}` for both. That pair is
 # all zoe needs. Nothing is guessed from the working directory; when Herdr has
 # no id, the caller says so.
+#
+# A Claude session does not always live under `~/.claude`. Claude Code keeps its
+# transcripts in the config directory, which is `$CLAUDE_CONFIG_DIR` when the
+# agent was started with one, and account switchers (CCS and friends) point it
+# at a per-account directory. So for Claude Code the transcript is looked for
+# where the agent itself says it is (see `claude_transcript`), and its path is
+# printed in place of the id when it is found; zoe opens a path and an id the
+# same way. Everything else is unchanged.
 set -euo pipefail
 
 herdr="${HERDR_BIN_PATH:-herdr}"
@@ -55,5 +63,60 @@ MSG
      exit 1 ;;
   *)  echo "Herdr reports a $kind for this $agent pane, and the plugin expects an id" >&2; exit 1 ;;
 esac
+
+# The value of an environment variable in another process's environment, as far
+# as this user may read it. Linux answers from /proc; macOS from `ps`, where
+# `e` asks for the environment and the extra `w` keeps it from being cut off.
+env_value_of() {
+  local pid="$1" name="$2"
+  if [ -r "/proc/$pid/environ" ]; then
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true
+  else
+    ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' || true
+  fi | sed -n "s/^$name=//p" | head -1
+}
+
+# The config directory the pane's agent is running with, if it can be read.
+#
+# This process does not have `$CLAUDE_CONFIG_DIR` itself: Herdr spawned this
+# pane from its server, and the server's environment is not the agent's, so a
+# switcher that exported it for one agent never reaches here. The agent's own
+# process does carry it, and `pane process-info` names the processes in the
+# pane, so the variable is read from the agent instead of assumed. The pane
+# shell is a fallback, for an agent that inherited a directory from the pane
+# rather than choosing one.
+claude_config_dir() {
+  local pid dir pids
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && { printf '%s' "$CLAUDE_CONFIG_DIR"; return 0; }
+  pids=$("$herdr" pane process-info --pane "$pane_id" 2>/dev/null \
+    | jq -r '.result.process_info | (.foreground_processes[]?.pid, .shell_pid)' 2>/dev/null || true)
+  for pid in $pids; do
+    case "$pid" in '' | null) continue ;; esac
+    dir=$(env_value_of "$pid" CLAUDE_CONFIG_DIR)
+    [ -n "$dir" ] && { printf '%s' "$dir"; return 0; }
+  done
+  return 1
+}
+
+# The transcript of a session inside a config directory: Claude Code names the
+# project directory after the working directory, which this does not need to
+# reproduce — the id is unique, so any project directory holding it is the one.
+transcript_of() {
+  local dir="$1" id="$2" file
+  for file in "$dir"/projects/*/"$id".jsonl; do
+    [ -f "$file" ] && { printf '%s' "$file"; return 0; }
+  done
+  return 1
+}
+
+# Claude Code first: hand over the transcript's own path when the config
+# directory and the file are both there. Otherwise the id, which is what
+# `~/.claude/projects` and the Codex layout answer to.
+if [ "$agent" = claude ] \
+  && dir=$(claude_config_dir) \
+  && file=$(transcript_of "$dir" "$value"); then
+  printf '%s %s\n' "$agent" "$file"
+  exit 0
+fi
 
 printf '%s %s\n' "$agent" "$value"
